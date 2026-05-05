@@ -1,0 +1,13 @@
+[Unit]
+Description=NetBox Plugin Auto-Installer
+After=docker.service
+Requires=docker.service
+
+[Service]
+Restart=always
+RestartSec=10
+ExecStart=/home/docker/netbox/config/scripts/netbox-plugin-watcher.sh
+User=docker
+
+[Install]
+WantedBy=multi-user.target
