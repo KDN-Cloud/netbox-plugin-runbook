@@ -123,3 +123,7 @@ docker compose restart netbox
 ```
 ~/netbox/config/scripts/install-netbox-plugins.sh
 ```
+
+## Related
+[CONFIG.md](CONFIG.md)
+
