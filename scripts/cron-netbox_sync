@@ -1,0 +1,1 @@
+0 3 * * * /bin/bash /home/docker/netbox/config/scripts/netbox_sync.sh >> /home/docker/netbox/config/scripts/netbox_sync.log 2>&1
