@@ -141,8 +141,12 @@ REFRESH_STAMP = "Scheduled DNS sync"
 
 STATE_FILE = Path("/config/dns-sync/observations.json")
 TOKEN_FILE = STATE_FILE.with_name("cloudflare.token")
+NAMECOM_CREDENTIALS = STATE_FILE.with_name("namecom.credentials")
 CLOUDFLARE_API = "https://api.cloudflare.com/client/v4"
 CLOUDFLARE_STAMP = "Cloudflare API"
+NAMECOM_API = "https://api.name.com/core/v1"
+NAMECOM_DOMAIN = "rantrs.net"
+NAMECOM_STAMP = "Name.com API"
 
 
 MIN_ABSENCE_SECONDS = 2 * 60 * 60
@@ -163,25 +167,46 @@ PROXY_NOTES = ("cloudflare proxy enabled", "cloudflare flattens", "without expos
 PRIVATE_NOTES = ("private dns from the netbox host", "private dns resolver")
 
 
-class CloudflareError(Exception):
+class DNSAPIError(Exception):
     pass
 
 
-def cloudflare_token():
+def read_private_file(path, limit):
     try:
-        fd = os.open(TOKEN_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return None
     except OSError:
-        raise CloudflareError("token file could not be opened securely") from None
+        raise DNSAPIError("credential file could not be opened securely") from None
     with os.fdopen(fd, "rb") as stream:
         mode = os.fstat(stream.fileno()).st_mode
         if not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o600:
-            raise CloudflareError("token file must be a regular file with mode 0600")
-        token = stream.read(1025).strip()
+            raise DNSAPIError("credential file must be a regular file with mode 0600")
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise DNSAPIError("credential file exceeds the expected size")
+    return data
+
+
+def cloudflare_token():
+    content = read_private_file(TOKEN_FILE, 1025)
+    if content is None:
+        return None
+    token = content.strip()
     if not re.fullmatch(rb"[!-~]{1,1024}", token):
-        raise CloudflareError("token file must contain one nonempty API token")
+        raise DNSAPIError("token file must contain one nonempty API token")
     return token.decode("ascii")
+
+
+def namecom_credentials():
+    content = read_private_file(NAMECOM_CREDENTIALS, 1282)
+    if content is None:
+        return None
+    lines = content.splitlines()
+    if (len(lines) != 2 or not re.fullmatch(rb"[!-~]{1,255}", lines[0])
+            or b":" in lines[0] or not re.fullmatch(rb"[!-~]{1,1024}", lines[1])):
+        raise DNSAPIError("credential file must contain a username and token on separate lines")
+    return lines[0].decode("ascii"), lines[1].decode("ascii")
 
 
 def cloudflare_pages(session, path, per_page, **filters):
@@ -193,32 +218,67 @@ def cloudflare_pages(session, path, per_page, **filters):
                                    params={**filters, "page": page, "per_page": per_page},
                                    timeout=8, allow_redirects=False)
             if response.status_code != 200:
-                raise CloudflareError(f"HTTP {response.status_code}")
+                raise DNSAPIError(f"HTTP {response.status_code}")
             body = response.json()
         except (requests.RequestException, ValueError):
-            raise CloudflareError("request or response could not be read") from None
+            raise DNSAPIError("request or response could not be read") from None
         if not isinstance(body, dict) or body.get("success") is not True or not isinstance(body.get("result"), list):
-            raise CloudflareError("API returned an unsuccessful or malformed response")
+            raise DNSAPIError("API returned an unsuccessful or malformed response")
         result = body["result"]
         info = body.get("result_info") or {}
         if not isinstance(info, dict) or info.get("page", page) != page:
-            raise CloudflareError("API returned an unexpected page")
+            raise DNSAPIError("API returned an unexpected page")
         for row in result:
             if not isinstance(row, dict) or not isinstance(row.get("id"), str) or row["id"] in seen:
-                raise CloudflareError("API returned duplicate or invalid inventory entries")
+                raise DNSAPIError("API returned duplicate or invalid inventory entries")
             seen.add(row["id"])
             records.append(row)
         last = info.get("total_pages")
         if last is not None and (not isinstance(last, int) or last < 0 or (page > last and (page > 1 or result))):
-            raise CloudflareError("API pagination metadata is invalid")
+            raise DNSAPIError("API pagination metadata is invalid")
         if last is not None and page >= last or last is None and len(result) < per_page:
             if info.get("total_count", len(records)) != len(records):
-                raise CloudflareError("API inventory count disagrees with the completed list")
+                raise DNSAPIError("API inventory count disagrees with the completed list")
             return records
-    raise CloudflareError("API pagination did not complete")
+    raise DNSAPIError("API pagination did not complete")
 
 
-def cloudflare_rdata(origin, kind, record):
+def namecom_records(session):
+    records = []
+    seen = set()
+    total = None
+    for page in range(1, 201):
+        try:
+            response = session.get(f"{NAMECOM_API}/domains/{NAMECOM_DOMAIN}/records",
+                                   params={"page": page, "perPage": 100},
+                                   timeout=8, allow_redirects=False)
+            if response.status_code != 200:
+                raise DNSAPIError(f"HTTP {response.status_code}")
+            body = response.json()
+        except (requests.RequestException, ValueError):
+            raise DNSAPIError("request or response could not be read") from None
+        if not isinstance(body, dict) or not isinstance(body.get("records"), list):
+            raise DNSAPIError("API returned a malformed record list")
+        count = body.get("totalCount")
+        if type(count) is not int or count < 0 or total is not None and count != total:
+            raise DNSAPIError("API record count changed or is invalid")
+        total = count
+        for row in body["records"]:
+            if not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] <= 0 or row["id"] in seen:
+                raise DNSAPIError("API returned duplicate or invalid record identifiers")
+            seen.add(row["id"])
+            records.append(row)
+        next_page = body.get("nextPage", 0)
+        if next_page in (0, None):
+            if len(records) != total:
+                raise DNSAPIError("API record count disagrees with the completed list")
+            return records
+        if type(next_page) is not int or next_page != page + 1 or len(records) >= total or not body["records"]:
+            raise DNSAPIError("API returned invalid pagination")
+    raise DNSAPIError("API pagination did not complete")
+
+
+def api_rdata(origin, kind, record):
     content = record.get("content") or ""
     data = record.get("data") or {}
 
@@ -240,7 +300,7 @@ def cloudflare_rdata(origin, kind, record):
     return rdata(origin, kind, content)
 
 
-def parse_cloudflare_records(name, records):
+def parse_api_records(name, records):
     origin = dns.name.from_text(name)
     inventory = defaultdict(dict)
     blocked = set()
@@ -250,19 +310,19 @@ def parse_cloudflare_records(name, records):
             fqdn = dns.name.from_text(row["name"]).canonicalize()
             owner = fqdn.relativize(origin).to_text()
         except (KeyError, AttributeError, TypeError, ValueError, dns.exception.DNSException):
-            raise CloudflareError("API returned an invalid record owner") from None
+            raise DNSAPIError("API returned an invalid record owner") from None
         if not fqdn.is_subdomain(origin):
-            raise CloudflareError("API returned a record outside the requested zone")
+            raise DNSAPIError("API returned a record outside the requested zone")
         kind = row.get("type")
         if not isinstance(kind, str) or not re.fullmatch(r"[A-Z0-9]{1,20}", kind):
-            raise CloudflareError("API returned an invalid record type")
+            raise DNSAPIError("API returned an invalid record type")
         if owner == "@" and kind in {"NS", "SOA"}:
             continue
         try:
             ttl = row["ttl"]
             if not isinstance(ttl, int) or not 1 <= ttl <= 2147483647:
                 raise ValueError("invalid TTL")
-            value = cloudflare_rdata(origin, kind, row)
+            value = api_rdata(origin, kind, row)
             key = (kind, value.to_digestable(origin))
         except (KeyError, AttributeError, TypeError, ValueError, dns.exception.DNSException):
             blocked.add(owner)
@@ -276,12 +336,59 @@ def parse_cloudflare_records(name, records):
     return inventory, blocked, unsupported
 
 
+def namecom_inventory(records):
+    origin = dns.name.from_text(NAMECOM_DOMAIN)
+    normalized = []
+    for row in records:
+        try:
+            if dns.name.from_text(row["domainName"]) != origin:
+                raise DNSAPIError("API returned a record for an unexpected domain")
+            host = row.get("host") or "@"
+            owner = dns.name.from_text(host, origin)
+            if row.get("fqdn") and dns.name.from_text(row["fqdn"]) != owner:
+                raise DNSAPIError("API record hostname and FQDN disagree")
+            kind = row["type"]
+            answer = row["answer"]
+            if not isinstance(answer, str) or not answer:
+                raise ValueError("invalid DNS answer")
+            data = {}
+            if kind == "SRV":
+                weight, port, target = answer.split()
+                data = {"priority": row["priority"], "weight": weight, "port": port, "target": target}
+            normalized.append({"name": owner.to_text(), "type": kind, "content": answer,
+                               "ttl": row["ttl"], "priority": row.get("priority"), "data": data})
+        except (KeyError, AttributeError, TypeError, ValueError, dns.exception.DNSException):
+            raise DNSAPIError("API returned an invalid Name.com record") from None
+    return parse_api_records(NAMECOM_DOMAIN, normalized)
+
+
+def collect_namecom(authorities):
+    summary = {"status": "disabled", "zones": 0, "errors": {}}
+    try:
+        auth = namecom_credentials()
+        if auth is None:
+            return {}, summary
+        authority = authorities.get(NAMECOM_DOMAIN)
+        if authority is None or authority[0] != ".name.com":
+            summary["status"] = "zone authority unavailable"
+            return {}, summary
+        with requests.Session() as session:
+            session.trust_env = False
+            session.auth = auth
+            inventory = namecom_inventory(namecom_records(session))
+    except DNSAPIError as error:
+        summary.update(status="error", errors={NAMECOM_DOMAIN: str(error)})
+        return {}, summary
+    summary.update(status="ready", zones=1)
+    return {NAMECOM_DOMAIN: inventory}, summary
+
+
 def collect_cloudflare(authorities):
     snapshots = {}
     summary = {"status": "disabled", "zones": 0, "errors": {}}
     try:
         token = cloudflare_token()
-    except CloudflareError as error:
+    except DNSAPIError as error:
         summary.update(status="error", errors={"token": str(error)})
         return snapshots, summary
     if token is None:
@@ -292,7 +399,7 @@ def collect_cloudflare(authorities):
         session.headers["Authorization"] = f"Bearer {token}"
         try:
             catalog = cloudflare_pages(session, "/zones", 50, status="active")
-        except CloudflareError as error:
+        except DNSAPIError as error:
             summary.update(status="error", errors={"zones": str(error)})
             return snapshots, summary
         by_name = defaultdict(list)
@@ -307,19 +414,19 @@ def collect_cloudflare(authorities):
                 continue
             try:
                 if len(matched) != 1:
-                    raise CloudflareError("zone inventory is ambiguous")
+                    raise DNSAPIError("zone inventory is ambiguous")
                 zone = matched[0]
                 ns = zone.get("name_servers")
                 if not isinstance(ns, list) or any(not isinstance(server, str) for server in ns) or {
                     server.rstrip(".").lower() for server in ns
                 } != set(servers):
-                    raise CloudflareError("zone nameservers differ from DNS delegation")
+                    raise DNSAPIError("zone nameservers differ from DNS delegation")
                 if not re.fullmatch(r"[a-f0-9]{32}", zone["id"]):
-                    raise CloudflareError("zone identifier is invalid")
-                snapshots[name] = parse_cloudflare_records(
+                    raise DNSAPIError("zone identifier is invalid")
+                snapshots[name] = parse_api_records(
                     name, cloudflare_pages(session, f"/zones/{zone['id']}/dns_records", 100),
                 )
-            except CloudflareError as error:
+            except DNSAPIError as error:
                 summary["errors"][name] = str(error)
     summary["zones"] = len(snapshots)
     summary["status"] = "partial" if summary["errors"] else "ready" if snapshots else "no matching zones"
@@ -343,8 +450,10 @@ def private_row(row):
             or row.type in ADDRESS_TYPES and any(ip_address(row.value) in net for net in PRIVATE_NETWORKS))
 
 
-def cloudflare_managed(row):
-    return any(line.startswith(f"{CLOUDFLARE_STAMP} — ") for line in (row.comments or "").splitlines())
+def api_managed(row, stamp=None):
+    stamps = (stamp,) if stamp else (CLOUDFLARE_STAMP, NAMECOM_STAMP)
+    prefixes = tuple(f"{value} — " for value in stamps)
+    return any(line.startswith(prefixes) for line in (row.comments or "").splitlines())
 
 
 def confirmed_absence(row, key, missing, next_missing, now, source):
@@ -475,7 +584,7 @@ def refresh_owner(writer, zone, owner, rows, public, local, provider, edge_netwo
     stats = Counter()
     origin = dns.name.from_text(zone.name)
     active = [(key, row) for key, row in rows if row.is_active]
-    api_types = {row.type for _, row in rows if cloudflare_managed(row) and (row.is_active or owner == "@")}
+    api_types = {row.type for _, row in rows if api_managed(row) and (row.is_active or owner == "@")}
     protect_api_hosts = bool(set(HOST_TYPES) & api_types)
     private = any(private_row(row) for _, row in active)
     documented_local = any(
@@ -545,8 +654,12 @@ def refresh_owner(writer, zone, owner, rows, public, local, provider, edge_netwo
     return stats
 
 
-def refresh_cloudflare_owner(writer, zone, owner, rows, desired, missing, next_missing, now):
+def refresh_api_owner(writer, zone, owner, rows, desired, missing, next_missing, now, stamp):
     stats = Counter()
+    provider = "Cloudflare" if stamp == CLOUDFLARE_STAMP else "Name.com"
+    source = "cloudflare" if stamp == CLOUDFLARE_STAMP else "namecom"
+    snapshot_stamp = STAMP if stamp == CLOUDFLARE_STAMP else "Name.com DNS snapshot"
+    conflicts = f"{source}_conflicts_preserved"
     active = [(key, row) for key, row in rows if row.is_active]
     desired_types = {kind for kind, _ in desired}
     flattened_apex = owner == "@" and "CNAME" in desired_types
@@ -560,7 +673,7 @@ def refresh_cloudflare_owner(writer, zone, owner, rows, desired, missing, next_m
         comments = (row.comments or "").lower()
         return (row.ipam_ip_address_id or row.ptr_record_id
                 or any(note in comments for note in PRIVATE_NOTES)
-                or private_row(row) and not cloudflare_managed(row) and STAMP.lower() not in comments)
+                or private_row(row) and not api_managed(row, stamp) and snapshot_stamp.lower() not in comments)
 
     retire = []
     for key, row in active:
@@ -570,20 +683,20 @@ def refresh_cloudflare_owner(writer, zone, owner, rows, desired, missing, next_m
         replace = row.type in active_types
         crosses_alias = ((row.type != "CNAME" and "CNAME" in active_types)
                          or (row.type == "CNAME" and bool(active_types)))
-        if crosses_alias and (cloudflare_managed(row) or STAMP.lower() in (row.comments or "").lower()
+        if crosses_alias and (api_managed(row, stamp) or snapshot_stamp.lower() in (row.comments or "").lower()
                               or "public authoritative dns" in (row.comments or "").lower()):
             replace = True
         if protected(row):
             if replace:
-                stats["cloudflare_conflicts_preserved"] += 1
+                stats[conflicts] += 1
                 return stats
-        elif replace or (cloudflare_managed(row)
-                         and confirmed_absence(row, key, missing, next_missing, now, "cloudflare")):
+        elif replace or (api_managed(row, stamp)
+                         and confirmed_absence(row, key, missing, next_missing, now, source)):
             retire.append(row)
 
     future_types = active_types | {row.type for _, row in active if row not in retire}
     if "CNAME" in future_types and len(future_types) > 1:
-        stats["cloudflare_conflicts_preserved"] += 1
+        stats[conflicts] += 1
         return stats
     actions = []
     for (kind, key), (value, ttl, proxied) in desired.items():
@@ -594,25 +707,26 @@ def refresh_cloudflare_owner(writer, zone, owner, rows, desired, missing, next_m
         )
         if row.pk and protected(row):
             if not row.is_active or row.ttl != preferred_ttls[kind]:
-                stats["cloudflare_conflicts_preserved"] += 1
+                stats[conflicts] += 1
                 return stats
             continue
         status = "inactive" if kind == "CNAME" and flattened_apex else "active"
-        note = "Cloudflare proxy enabled." if proxied else "DNS record from Cloudflare."
+        note = "Cloudflare proxy enabled." if proxied else f"DNS record from {provider}."
         if kind == "CNAME" and flattened_apex:
-            note += " Cloudflare flattens this apex alias."
+            note += (" Cloudflare flattens this apex alias." if stamp == CLOUDFLARE_STAMP
+                     else " Apex alias documented as inactive.")
         if ttl == 1:
             note += " Automatic TTL."
         elif ttl != preferred_ttls[kind]:
-            note += f" Cloudflare configured TTL {ttl}; NetBox uses the common record-set TTL."
-        comments = annotated(annotated(row.comments, "", STAMP), note, CLOUDFLARE_STAMP)
+            note += f" {provider} configured TTL {ttl}; NetBox uses the common record-set TTL."
+        comments = annotated(annotated(row.comments, "", snapshot_stamp), note, stamp)
         actions.append((row, preferred_ttls[kind], status, comments))
         if proxied:
             stats["cloudflare_proxied_records"] += 1
 
     for row in retire:
         writer.save(row, status="inactive",
-                    comments=annotated(row.comments, "Replaced or confirmed absent in Cloudflare.", CLOUDFLARE_STAMP))
+                    comments=annotated(row.comments, f"Replaced or confirmed absent in {provider}.", stamp))
     for row, ttl, status, comments in sorted(actions, key=lambda item: item[0].pk is None):
         writer.save(row, status=status, ttl=ttl, comments=comments)
     stats["marked_inactive"] += len(retire)
@@ -645,7 +759,8 @@ def refresh_dns(configured, apply):
         edges = None
         results["cloudflare_ip_ranges_unavailable"] = 1
     observations, authorities, unavailable = collect_dns(configured)
-    cloudflare, api_summary = collect_cloudflare(authorities)
+    cloudflare, cloudflare_summary = collect_cloudflare(authorities)
+    namecom, namecom_summary = collect_namecom(authorities)
     missing = load_observations()
     next_missing = {}
     writer = ScheduledDNSImport()
@@ -660,20 +775,28 @@ def refresh_dns(configured, apply):
             existing = defaultdict(list)
             for (owner, _), rows in existing_rows(zone, dns.name.from_text(name)).items():
                 existing[owner].extend(rows)
-            inventory, blocked, unsupported = cloudflare.get(name, ({}, set(), {}))
+            inventory, blocked, unsupported = ({}, set(), {})
+            stamp = None
+            if name in cloudflare:
+                inventory, blocked, unsupported = cloudflare[name]
+                stamp = CLOUDFLARE_STAMP
+                results["cloudflare_unsupported_records"] += sum(unsupported.values())
+            elif name in namecom:
+                inventory, blocked, unsupported = namecom[name]
+                stamp = NAMECOM_STAMP
+                results["namecom_unsupported_records"] += sum(unsupported.values())
             public_names = {owner: result for (zone_name, owner), result in observations.items() if zone_name == name}
             api_names = set(inventory) | blocked
-            if name in cloudflare:
+            if stamp:
                 api_names.update(owner for owner, rows in existing.items()
-                                 if any(cloudflare_managed(row) for _, row in rows if row.is_active))
-            results["cloudflare_unsupported_records"] += sum(unsupported.values())
+                                 if any(api_managed(row, stamp) for _, row in rows if row.is_active))
             for owner in sorted(set(public_names) | api_names):
                 results["checked_names"] += 1
                 if owner in blocked:
                     continue
                 if owner in api_names:
-                    results.update(refresh_cloudflare_owner(writer, zone, owner, existing[owner],
-                                                            inventory.get(owner, {}), missing, next_missing, now))
+                    results.update(refresh_api_owner(writer, zone, owner, existing[owner],
+                                                     inventory.get(owner, {}), missing, next_missing, now, stamp))
                 else:
                     public, local = public_names[owner]
                     results.update(refresh_owner(writer, zone, owner, existing[owner], public, local, authority[0],
@@ -682,5 +805,6 @@ def refresh_dns(configured, apply):
             transaction.set_rollback(True)
     if apply:
         save_observations(next_missing)
-    print(json.dumps({"mode": "apply" if apply else "preview", "changes": writer.changes, "cloudflare_api": api_summary,
+    print(json.dumps({"mode": "apply" if apply else "preview", "changes": writer.changes,
+                      "cloudflare_api": cloudflare_summary, "namecom_api": namecom_summary,
                       "unavailable_zones": sorted(set(unavailable)), "summary": results}, sort_keys=True), flush=True)

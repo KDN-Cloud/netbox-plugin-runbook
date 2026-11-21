@@ -4,4 +4,6 @@ observations.json
 observations.tmp
 cloudflare.token
 .cloudflare-token.*
+namecom.credentials
+.namecom-credentials.*
 __pycache__/

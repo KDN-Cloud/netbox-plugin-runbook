@@ -4,7 +4,7 @@ Docker-host cron runs [the refresh script](scripts/dns-sync/run-dns-refresh.sh) 
 
 NetBox's **DNS hosts** dashboard tile and directory read those records directly. A job that makes changes records them in NetBox's change log under **Scheduled DNS sync**. Repeated authoritative absence is required before a public record is marked inactive. Provider records, local resolver settings, and retired zones stay outside the write scope.
 
-The updater reads live DNS, Nginx Proxy Manager's configuration and, when configured, the Cloudflare API. Keep bulk-import snapshots in the [DNS data repo](https://git.kf7.dev/ak/netbox-dns-data). Discovering new local overrides outside the proxy configuration requires a source that can enumerate them.
+The updater reads live DNS, Nginx Proxy Manager's configuration, and Cloudflare and Name.com inventories when credentials are configured. Keep bulk-import snapshots in the [DNS data repo](https://git.kf7.dev/ak/netbox-dns-data). Discovering new local overrides outside the proxy configuration requires a source that can enumerate them.
 
 ## Cloudflare API access
 
@@ -28,6 +28,21 @@ On the Docker host, store the token alone in `/home/docker/netbox/config/dns-syn
 ```
 
 Run `run-dns-refresh.sh --preview` from the sync directory after saving or replacing the token. The `cloudflare_api` summary shows how many zones returned complete lists and any access errors. The sync imports new records and changes to proxy origins for active Cloudflare zones whose API nameservers match public delegation. Known API records remain protected if a token or endpoint fails. Local and Name.com lookups continue, and conflicting local or linked records stay in place for review. Cloudflare serves its own public addresses for proxied records. NetBox records the configured origin and represents Cloudflare's automatic TTL as 300 seconds. Flattened apex CNAMEs are recorded as inactive aliases to fit NetBox's DNS model.
+
+## Name.com API access
+
+The sync calls [Name.com's production DNS list endpoint](https://docs.name.com/api/v1/reference/dns/list-records) using a Name.com API username and token. It fetches only `rantrs.net` while that zone is active in NetBox and publicly delegated to Name.com. Use a dedicated production credential with DNS read access if offered by [Name.com API settings](https://www.name.com/account/settings/api).
+
+Install [the credential helper](scripts/dns-sync/set-namecom-credentials.sh) on the Docker host and use it to store the username and token through hidden prompts.
+
+```bash
+target=/home/docker/netbox/config/dns-sync
+install -m 700 scripts/dns-sync/set-namecom-credentials.sh "$target/set-namecom-credentials.sh"
+"$target/set-namecom-credentials.sh"
+"$target/run-dns-refresh.sh" --preview
+```
+
+The helper writes `namecom.credentials` under the persistent sync directory with mode `0600`. NetBox reads it from `/config/dns-sync`. The `namecom_api` preview summary reports access status. An incomplete record list or credential error leaves API-managed records in place. Cloudflare sync and the public DNS checks continue. Provider-specific types that cannot be represented safely are counted and skipped for review.
 
 ## Production schedule
 
