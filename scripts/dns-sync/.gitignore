@@ -2,4 +2,6 @@
 *.lock
 observations.json
 observations.tmp
+cloudflare.token
+.cloudflare-token.*
 __pycache__/

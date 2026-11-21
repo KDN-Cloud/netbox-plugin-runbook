@@ -4,7 +4,30 @@ Docker-host cron runs [the refresh script](scripts/dns-sync/run-dns-refresh.sh) 
 
 NetBox's **DNS hosts** dashboard tile and directory read those records directly. A job that makes changes records them in NetBox's change log under **Scheduled DNS sync**. Repeated authoritative absence is required before a public record is marked inactive. Provider records, local resolver settings, and retired zones stay outside the write scope.
 
-The updater uses live DNS and Nginx Proxy Manager's configuration. It does not pull a Git repository at runtime. Keep bulk-import snapshots in the [DNS data repo](https://git.kf7.dev/ak/netbox-dns-data). Discovering arbitrary new records and reading Cloudflare's hidden proxy origins requires access to the provider's inventory. Discovering new local overrides outside the proxy configuration requires a source that can enumerate them.
+The updater reads live DNS, Nginx Proxy Manager's configuration and, when configured, the Cloudflare API. Keep bulk-import snapshots in the [DNS data repo](https://git.kf7.dev/ak/netbox-dns-data). Discovering new local overrides outside the proxy configuration requires a source that can enumerate them.
+
+## Cloudflare API access
+
+Create a dedicated custom token with **Zone → Zone → Read** and **Zone → DNS → Read**. Include only the Cloudflare zones managed in NetBox. The first permission resolves zone IDs and nameservers. The second lists DNS records and configured proxy origins. See the [Cloudflare token setup](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/).
+
+On the Docker host, store the token alone in `/home/docker/netbox/config/dns-sync/cloudflare.token`, owned by the Docker operator with mode `0600`. NetBox reads it as `/config/dns-sync/cloudflare.token`. Use a hidden terminal prompt to install it without putting it in shell history.
+
+```bash
+(
+  set -e
+  umask 077
+  cd /home/docker/netbox/config/dns-sync
+  IFS= read -rsp 'Cloudflare API token: ' token
+  printf '\n'
+  test -n "$token"
+  temporary=$(mktemp .cloudflare-token.XXXXXXXX)
+  trap 'rm -f -- "$temporary"' EXIT
+  printf '%s\n' "$token" > "$temporary"
+  mv -f -- "$temporary" cloudflare.token
+)
+```
+
+Run `run-dns-refresh.sh --preview` from the sync directory after saving or replacing the token. The `cloudflare_api` summary shows how many zones returned complete lists and any access errors. The sync imports new records and changes to proxy origins for active Cloudflare zones whose API nameservers match public delegation. Known API records remain protected if a token or endpoint fails. Local and Name.com lookups continue, and conflicting local or linked records stay in place for review. Cloudflare serves its own public addresses for proxied records. NetBox records the configured origin and represents Cloudflare's automatic TTL as 300 seconds. Flattened apex CNAMEs are recorded as inactive aliases to fit NetBox's DNS model.
 
 ## Production schedule
 
