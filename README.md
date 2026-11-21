@@ -139,6 +139,10 @@ This runs the exact same import logic as the cron job, minus the `--vendors` fil
 
 ---
 
+## DNS Refresh (Automated)
+
+See [NetBox DNS refresh](DNS-SYNC.md) for the four-hour schedule, script source, and rollback-only preview.
+
 ## Troubleshooting
 
 **NetBox crashes with `ModuleNotFoundError` on startup:**  
