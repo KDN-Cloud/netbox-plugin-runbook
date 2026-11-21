@@ -6,4 +6,6 @@ cloudflare.token
 .cloudflare-token.*
 namecom.credentials
 .namecom-credentials.*
+pfsense.token
+.pfsense-token.*
 __pycache__/

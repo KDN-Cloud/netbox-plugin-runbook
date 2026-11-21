@@ -26,7 +26,7 @@ import requests
 from core.choices import ObjectChangeActionChoices
 from django.core.exceptions import ValidationError
 from django.db import transaction
-from netbox_dns.models import NameServer, Record, Zone
+from netbox_dns.models import NameServer, Record, View, Zone
 
 
 def field_matches(current, wanted):
@@ -147,6 +147,11 @@ CLOUDFLARE_STAMP = "Cloudflare API"
 NAMECOM_API = "https://api.name.com/core/v1"
 NAMECOM_DOMAIN = "rantrs.net"
 NAMECOM_STAMP = "Name.com API"
+PFSENSE_TOKEN = STATE_FILE.with_name("pfsense.token")
+PFSENSE_HOST = "pfsense.lan.kdn.cloud"
+PFSENSE_STAMP = "pfSense DNS Resolver"
+PFSENSE_VIEW = "pfSense local DNS"
+PFSENSE_TTL = 3600
 
 
 MIN_ABSENCE_SECONDS = 2 * 60 * 60
@@ -188,8 +193,8 @@ def read_private_file(path, limit):
     return data
 
 
-def cloudflare_token():
-    content = read_private_file(TOKEN_FILE, 1025)
+def read_token(path):
+    content = read_private_file(path, 1025)
     if content is None:
         return None
     token = content.strip()
@@ -207,6 +212,75 @@ def namecom_credentials():
             or b":" in lines[0] or not re.fullmatch(rb"[!-~]{1,1024}", lines[1])):
         raise DNSAPIError("credential file must contain a username and token on separate lines")
     return lines[0].decode("ascii"), lines[1].decode("ascii")
+
+
+def pfsense_overrides(session):
+    # This plural endpoint supports limit=0 for a complete snapshot.
+    try:
+        response = session.get(f"https://{PFSENSE_HOST}/api/v2/services/dns_resolver/host_overrides",
+                               params={"limit": 0, "offset": 0},
+                               timeout=10, allow_redirects=False)
+        if response.status_code != 200:
+            raise DNSAPIError(f"HTTP {response.status_code}")
+        body = response.json()
+    except (requests.RequestException, ValueError):
+        raise DNSAPIError("request or response could not be read") from None
+    if not isinstance(body, dict) or body.get("status") != "ok" or not isinstance(body.get("data"), list):
+        raise DNSAPIError("API returned a malformed local override list")
+    return body["data"]
+
+
+def pfsense_inventory(overrides):
+    names = defaultdict(set)
+    seen_ids = set()
+    for override in overrides:
+        try:
+            identifier = override["id"]
+            if type(identifier) is not int or identifier < 0 or identifier in seen_ids:
+                raise ValueError
+            seen_ids.add(identifier)
+            aliases = override.get("aliases")
+            if aliases is None:
+                aliases = []
+            if not isinstance(aliases, list):
+                raise ValueError
+            addresses = override["ip"]
+            if not isinstance(addresses, list) or not addresses:
+                raise ValueError
+            parsed = set()
+            for address in addresses:
+                if not isinstance(address, str) or "%" in address:
+                    raise ValueError
+                parsed.add(ip_address(address))
+            for entry in [override, *aliases]:
+                domain, host = entry["domain"], entry["host"]
+                if not isinstance(domain, str) or not domain or not isinstance(host, str):
+                    raise ValueError
+                fqdn = dns.name.from_text(f"{host}.{domain}" if host else domain).canonicalize()
+                if fqdn == dns.name.root:
+                    raise ValueError
+                names[fqdn].update(parsed)
+        except (AttributeError, KeyError, TypeError, ValueError, dns.exception.DNSException):
+            raise DNSAPIError("API returned an invalid local override or alias") from None
+    return names
+
+
+def collect_pfsense():
+    summary = {"status": "disabled", "overrides": 0, "names": 0}
+    try:
+        token = read_token(PFSENSE_TOKEN)
+        if token is None:
+            return {}, summary
+        with requests.Session() as session:
+            session.trust_env = False
+            session.headers["X-API-Key"] = token
+            overrides = pfsense_overrides(session)
+        inventory = pfsense_inventory(overrides)
+    except DNSAPIError as error:
+        summary.update(status="error", error=str(error))
+        return {}, summary
+    summary.update(status="ready", overrides=len(overrides), names=len(inventory))
+    return inventory, summary
 
 
 def cloudflare_pages(session, path, per_page, **filters):
@@ -387,7 +461,7 @@ def collect_cloudflare(authorities):
     snapshots = {}
     summary = {"status": "disabled", "zones": 0, "errors": {}}
     try:
-        token = cloudflare_token()
+        token = read_token(TOKEN_FILE)
     except DNSAPIError as error:
         summary.update(status="error", errors={"token": str(error)})
         return snapshots, summary
@@ -733,6 +807,80 @@ def refresh_api_owner(writer, zone, owner, rows, desired, missing, next_missing,
     return stats
 
 
+def refresh_pfsense_zone(writer, zone, rrsets, missing, next_missing, now):
+    origin = dns.name.from_text(zone.name)
+    stored = existing_rows(zone, origin)
+    stats = Counter()
+    managed = {
+        identity for identity, rows in stored.items()
+        if any(row.is_active and api_managed(row, PFSENSE_STAMP) for _, row in rows)
+    }
+    for owner, kind in sorted(managed | rrsets.keys()):
+        desired = {answer.to_digestable(origin): answer for answer in rrsets.get((owner, kind), ())}
+        rows = stored[owner, kind]
+        active = {key: row for key, row in rows if row.is_active}
+        if desired and (any(row.is_active for _, row in stored.get((owner, "CNAME"), ()))
+                        or any(key not in desired and (key is None or row.ipam_ip_address_id
+                               or row.ptr_record_id or not api_managed(row, PFSENSE_STAMP))
+                               for key, row in active.items())):
+            stats["pfsense_conflicts_preserved"] += 1
+            continue
+        for key, row in active.items():
+            if (key is None or key in desired or not api_managed(row, PFSENSE_STAMP)
+                    or row.ipam_ip_address_id or row.ptr_record_id):
+                continue
+            if desired or confirmed_absence(row, key, missing, next_missing, now, "pfsense"):
+                writer.save(row, status="inactive",
+                            comments=annotated(row.comments, "Replaced or absent in local DNS.", PFSENSE_STAMP))
+                stats["pfsense_marked_inactive"] += 1
+        for key, answer in sorted(desired.items()):
+            row = active.get(key) or next((row for old_key, row in rows
+                                         if old_key == key and api_managed(row, PFSENSE_STAMP)), None)
+            if row and (not api_managed(row, PFSENSE_STAMP) or row.ipam_ip_address_id or row.ptr_record_id):
+                continue
+            row = row or Record(zone=zone, name=owner, type=kind, value=answer.to_text(), disable_ptr=True)
+            writer.save(row, status="active", ttl=PFSENSE_TTL,
+                        comments=annotated(row.comments, "Configured local host override or alias.", PFSENSE_STAMP))
+    return stats
+
+
+def refresh_pfsense(writer, inventory, domains, missing, next_missing, now):
+    stats = Counter()
+    origins = sorted((dns.name.from_text(domain) for domain in domains), key=len, reverse=True)
+    rrsets_by_zone = defaultdict(lambda: defaultdict(set))
+    for name, addresses in inventory.items():
+        origin = next((origin for origin in origins if name.is_subdomain(origin)), None)
+        if origin is None:
+            stats["pfsense_names_outside_managed_zones"] += 1
+            continue
+        stats["pfsense_names_in_managed_zones"] += 1
+        for addr in addresses:
+            kind = "A" if addr.version == 4 else "AAAA"
+            owner = name.relativize(origin).to_text()
+            rrsets_by_zone[origin.to_text(True)][owner, kind].add(rdata(origin, kind, str(addr)))
+
+    view = View.objects.filter(name=PFSENSE_VIEW).first()
+    if view is None and not rrsets_by_zone:
+        return stats
+    if view is None:
+        view = writer.save(View(name=PFSENSE_VIEW, description="Private host overrides from pfSense"))
+    zones = {zone.name: zone for zone in view.zones.select_for_update().filter(name__in=domains)}
+    for name in sorted(rrsets_by_zone.keys() | zones.keys()):
+        zone = zones.get(name)
+        if zone is None:
+            resolver = writer.ensure(NameServer, {"name": PFSENSE_HOST})
+            zone = writer.save(Zone(view=view, name=name, status="active",
+                                    description="pfSense host overrides. SOA metadata is for NetBox.",
+                                    soa_rname=f"hostmaster.{name}", soa_mname=resolver,
+                                    default_ttl=PFSENSE_TTL, soa_ttl=PFSENSE_TTL, soa_serial_auto=True))
+            zone.nameservers.add(resolver)
+        if zone.status != "active":
+            stats["pfsense_inactive_zones_preserved"] += 1
+            continue
+        stats.update(refresh_pfsense_zone(writer, zone, rrsets_by_zone.get(name, {}), missing, next_missing, now))
+    return stats
+
+
 def load_observations():
     if not STATE_FILE.exists():
         return {}
@@ -761,11 +909,14 @@ def refresh_dns(configured, apply):
     observations, authorities, unavailable = collect_dns(configured)
     cloudflare, cloudflare_summary = collect_cloudflare(authorities)
     namecom, namecom_summary = collect_namecom(authorities)
+    pfsense, pfsense_summary = collect_pfsense()
     missing = load_observations()
     next_missing = {}
     writer = ScheduledDNSImport()
     with transaction.atomic():
         zones = {zone.name: zone for zone in Zone.objects.select_for_update().filter(view_id=1, status="active")}
+        if pfsense_summary["status"] == "ready":
+            results.update(refresh_pfsense(writer, pfsense, zones.keys(), missing, next_missing, now))
         for name, authority in authorities.items():
             zone = zones[name]
             if not verified_authority(writer, zone, authority):
@@ -807,4 +958,5 @@ def refresh_dns(configured, apply):
         save_observations(next_missing)
     print(json.dumps({"mode": "apply" if apply else "preview", "changes": writer.changes,
                       "cloudflare_api": cloudflare_summary, "namecom_api": namecom_summary,
+                      "pfsense_api": pfsense_summary,
                       "unavailable_zones": sorted(set(unavailable)), "summary": results}, sort_keys=True), flush=True)
